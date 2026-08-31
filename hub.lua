@@ -32,7 +32,7 @@ local player = Players.LocalPlayer
 -- If you run hub.lua directly, replace the placeholder below.
 local BASE_URL =
     (getgenv and getgenv().R63_REPO_BASE)
-    or "https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPOSITORY/main"
+    or "https://raw.githubusercontent.com/a65407112-boop/r63/main"
 
 BASE_URL = BASE_URL:gsub("/+$", "")
 
