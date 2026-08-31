@@ -1,23 +1,19 @@
--- R63 GUI loader
--- Repository: https://github.com/a65407112-boop/r63
+-- R63 GUI v2 loader
+-- https://github.com/a65407112-boop/r63
 
-local BASE = "https://raw.githubusercontent.com/a65407112-boop/r63/main"
-
-if getgenv then
-    getgenv().R63_REPO_BASE = BASE
-end
+local URL = "https://raw.githubusercontent.com/a65407112-boop/r63/main/hub.lua?r63v=2"
 
 local ok, source = pcall(function()
-    return game:HttpGet(BASE .. "/hub.lua", true)
+    return game:HttpGet(URL, true)
 end)
 
-if not ok or type(source) ~= "string" or #source < 50 then
-    error("R63 GUI: failed to download hub.lua from GitHub.")
+if not ok or type(source) ~= "string" or #source < 100 then
+    error("R63 GUI: failed to download hub.lua.")
 end
 
-local fn, compileError = loadstring(source)
+local fn, err = loadstring(source)
 if not fn then
-    error("R63 GUI: hub.lua compile error: " .. tostring(compileError))
+    error("R63 GUI hub compile error: " .. tostring(err))
 end
 
 fn()
