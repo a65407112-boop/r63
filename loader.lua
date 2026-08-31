@@ -1,7 +1,7 @@
--- R63 GUI v2 loader
--- https://github.com/a65407112-boop/r63
+-- R63 GUI v3 loader
+-- Repo: https://github.com/a65407112-boop/r63
 
-local URL = "https://raw.githubusercontent.com/a65407112-boop/r63/main/hub.lua?r63v=2"
+local URL = "https://raw.githubusercontent.com/a65407112-boop/r63/main/hub.lua?r63v=3"
 
 local ok, source = pcall(function()
     return game:HttpGet(URL, true)
