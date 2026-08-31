@@ -1,5 +1,5 @@
 --[[
-    R63 GUI v3
+    R63 GUI v3 Compact
     Repository: https://github.com/a65407112-boop/r63
 
     v3:
@@ -92,7 +92,7 @@ local function getChar()
     end
 
     if hum.RigType ~= Enum.HumanoidRigType.R6 then
-        error("R63 GUI v3 requires an R6 character.")
+        error("R63 GUI v3 Compact requires an R6 character.")
     end
 
     return char, hum
@@ -149,7 +149,7 @@ local function downloadMesh(file)
     end
 
     if not valid then
-        local body = httpGet(BASE .. "/meshes/" .. file .. "?r63v=3")
+        local body = httpGet(BASE .. "/meshes/" .. file .. "?r63v=3compact")
         writefile(path, body)
     end
 
@@ -864,6 +864,35 @@ main.BackgroundColor3 = Color3.fromRGB(24, 24, 29)
 main.BorderSizePixel = 0
 main.Parent = gui
 
+local guiScale = Instance.new("UIScale")
+guiScale.Name = "R63CompactScale"
+guiScale.Scale = 0.78
+guiScale.Parent = main
+
+local camera = workspace.CurrentCamera
+local function updateGuiScale()
+    camera = workspace.CurrentCamera or camera
+    if not camera then
+        guiScale.Scale = 0.78
+        return
+    end
+    local viewport = camera.ViewportSize
+    local fitX = math.max(240, viewport.X - 24) / 430
+    local fitY = math.max(300, viewport.Y - 40) / 552
+    guiScale.Scale = math.clamp(math.min(0.78, fitX, fitY), 0.56, 0.78)
+end
+updateGuiScale()
+if camera then
+    camera:GetPropertyChangedSignal("ViewportSize"):Connect(updateGuiScale)
+end
+workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+    camera = workspace.CurrentCamera
+    updateGuiScale()
+    if camera then
+        camera:GetPropertyChangedSignal("ViewportSize"):Connect(updateGuiScale)
+    end
+end)
+
 local corner = Instance.new("UICorner")
 corner.CornerRadius = UDim.new(0, 12)
 corner.Parent = main
@@ -881,7 +910,7 @@ local title = Instance.new("TextLabel")
 title.Size = UDim2.new(1, -58, 1, 0)
 title.Position = UDim2.fromOffset(16, 0)
 title.BackgroundTransparency = 1
-title.Text = "R63 GUI v3"
+title.Text = "R63 GUI v3 Compact"
 title.TextColor3 = Color3.fromRGB(245, 245, 250)
 title.TextXAlignment = Enum.TextXAlignment.Left
 title.Font = Enum.Font.GothamBold
