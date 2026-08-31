@@ -1,14 +1,19 @@
 --[[
-    R63 GUI v3 Compact
-    Repository: https://github.com/a65407112-boop/r63
+    R63 GUI v4 - Rebuild Morph
+    Repo: https://github.com/a65407112-boop/r63
 
-    v3:
-      * Skin Color bar.
-      * Transparent areas of remapped Shirt/Pants use the selected skin color.
-      * More reliable catalog accessory loading.
-      * Manual Attachment/Weld fallback for accessories when Humanoid:AddAccessory
-        does not attach them correctly.
-      * Existing accessories are preserved.
+    Main design:
+      * Save the current classic outfit/accessories first.
+      * Remove current cosmetic instances.
+      * Hide the original R6 torso/arms/legs.
+      * Build a separate welded visual body using the custom .mesh files.
+      * Remap Shirt/Pants textures onto matching custom body meshes.
+      * If no IDs are provided, use the outfit that was already on the character.
+      * If IDs are provided, only categories actually found in those IDs override
+        the saved outfit. Missing categories keep the saved version.
+      * Accessories are attached by matching Attachments with a legacy R6 fallback.
+      * Compact HSV color wheel.
+      * GUI always opens centered.
 ]]
 
 local BASE = "https://raw.githubusercontent.com/a65407112-boop/r63/main"
@@ -27,10 +32,10 @@ if getgenv and getgenv().R63_GUI_OBJECT then
     end)
 end
 
-local CACHE_DIR = "r63_gui_v3"
+local CACHE_DIR = "r63_gui_v4"
 local MESH_DIR = CACHE_DIR .. "/meshes"
 
-local BODY = {
+local BODY_FILES = {
     ["Torso"] = "torso.mesh",
     ["Left Arm"] = "leftarm.mesh",
     ["Right Arm"] = "rightarm.mesh",
@@ -58,41 +63,31 @@ local PANTS_PARTS = {
     ["Right Leg"] = true,
 }
 
-local SKIN_TONES = {
-    Color3.fromRGB(255, 224, 189),
-    Color3.fromRGB(248, 207, 169),
-    Color3.fromRGB(238, 190, 145),
-    Color3.fromRGB(224, 172, 105),
-    Color3.fromRGB(205, 146, 90),
-    Color3.fromRGB(186, 124, 82),
-    Color3.fromRGB(163, 105, 71),
-    Color3.fromRGB(141, 85, 60),
-    Color3.fromRGB(120, 72, 52),
-    Color3.fromRGB(98, 59, 45),
-    Color3.fromRGB(78, 46, 36),
-    Color3.fromRGB(58, 35, 29),
-}
-
-local localMeshUris = {}
-local addedByGui = {}
+local meshUris = {}
+local morphActive = false
 local autoReapply = false
 local lastIdText = ""
-local morphActive = false
-local clothingSyncBusy = false
-local selectedSkinColor = SKIN_TONES[2]
-local skinButtons = {}
-local selectedSkinIndex = 2
+local savedOutfit = nil
 
-local function getChar()
+-- HSV skin state. Starts near a common light skin tone.
+local skinH = 0.075
+local skinS = 0.30
+local skinV = 1.00
+
+local function currentSkinColor()
+    return Color3.fromHSV(skinH, skinS, skinV)
+end
+
+local function getCharacter()
     local char = player.Character or player.CharacterAdded:Wait()
     local hum = char:FindFirstChildOfClass("Humanoid") or char:WaitForChild("Humanoid", 10)
 
     if not hum then
-        error("Humanoid not found.")
+        error("R63 GUI: Humanoid not found.")
     end
 
     if hum.RigType ~= Enum.HumanoidRigType.R6 then
-        error("R63 GUI v3 Compact requires an R6 character.")
+        error("R63 GUI: this morph requires R6.")
     end
 
     return char, hum
@@ -104,436 +99,218 @@ local function ensureFolder(path)
     end
 end
 
-local function httpGet(url)
-    local ok, body = pcall(function()
-        return game:HttpGet(url, true)
-    end)
-
-    if not ok or type(body) ~= "string" or #body < 16 then
-        error("Failed to download: " .. url)
-    end
-
-    return body
-end
-
-local function localAsset(path)
+local function customAsset(path)
     if getcustomasset then
         return getcustomasset(path)
-    elseif getsynasset then
+    end
+
+    if getsynasset then
         return getsynasset(path)
     end
 
-    error("Your executor needs getcustomasset or getsynasset.")
+    error("R63 GUI: executor needs getcustomasset or getsynasset.")
 end
 
 local function downloadMesh(file)
-    if localMeshUris[file] then
-        return localMeshUris[file]
+    if meshUris[file] then
+        return meshUris[file]
     end
 
     if not writefile then
-        error("Your executor needs writefile.")
+        error("R63 GUI: executor needs writefile.")
     end
 
     ensureFolder(CACHE_DIR)
     ensureFolder(MESH_DIR)
 
     local path = MESH_DIR .. "/" .. file
-    local valid = false
+    local good = false
 
     if isfile and readfile and isfile(path) then
-        local ok, data = pcall(readfile, path)
-        if ok and type(data) == "string" and #data > 100 then
-            valid = true
-        end
+        local ok, bytes = pcall(readfile, path)
+        good = ok and type(bytes) == "string" and #bytes > 100
     end
 
-    if not valid then
-        local body = httpGet(BASE .. "/meshes/" .. file .. "?r63v=3compact")
-        writefile(path, body)
-    end
+    if not good then
+        local ok, bytes = pcall(function()
+            return game:HttpGet(BASE .. "/meshes/" .. file .. "?r63v=4", true)
+        end)
 
-    local uri = localAsset(path)
-    localMeshUris[file] = uri
-    return uri
-end
-
-local function nearestSkinTone(color)
-    local bestIndex = 1
-    local bestDistance = math.huge
-
-    for i, tone in ipairs(SKIN_TONES) do
-        local dr = color.R - tone.R
-        local dg = color.G - tone.G
-        local db = color.B - tone.B
-        local distance = dr * dr + dg * dg + db * db
-
-        if distance < bestDistance then
-            bestDistance = distance
-            bestIndex = i
-        end
-    end
-
-    return bestIndex
-end
-
-local function rememberOriginalColor(part)
-    if part and part:IsA("BasePart") and part:GetAttribute("R63OriginalColor") == nil then
-        part:SetAttribute("R63OriginalColor", part.Color)
-    end
-end
-
-local function updateSkinButtonSelection()
-    for i, button in ipairs(skinButtons) do
-        local stroke = button:FindFirstChild("SelectedStroke")
-        if stroke then
-            stroke.Enabled = (i == selectedSkinIndex)
-        end
-    end
-end
-
-local function applySkinColor(char, color)
-    selectedSkinColor = color
-
-    for _, partName in ipairs(BODY_ORDER) do
-        local part = char:FindFirstChild(partName)
-        if part and part:IsA("BasePart") then
-            rememberOriginalColor(part)
-            part.Color = color
-        end
-    end
-
-    local head = char:FindFirstChild("Head")
-    if head and head:IsA("BasePart") then
-        rememberOriginalColor(head)
-        head.Color = color
-    end
-
-    for _, obj in ipairs(char:GetChildren()) do
-        if obj:GetAttribute("R63ClothingOverlay") and obj:IsA("BasePart") then
-            obj.Color = color
-        end
-    end
-end
-
-local function restoreOriginalColors(char)
-    for _, obj in ipairs(char:GetChildren()) do
-        if obj:IsA("BasePart") then
-            local original = obj:GetAttribute("R63OriginalColor")
-            if typeof(original) == "Color3" then
-                obj.Color = original
-                obj:SetAttribute("R63OriginalColor", nil)
-            end
-        end
-    end
-end
-
-local function initializeSkinFromCharacter()
-    local char = player.Character
-    if not char then
-        return
-    end
-
-    local sample = char:FindFirstChild("Head") or char:FindFirstChild("Torso")
-    if sample and sample:IsA("BasePart") then
-        selectedSkinIndex = nearestSkinTone(sample.Color)
-        selectedSkinColor = SKIN_TONES[selectedSkinIndex]
-    end
-end
-
-initializeSkinFromCharacter()
-
-local function removeOldR63Objects(char)
-    for _, obj in ipairs(char:GetDescendants()) do
-        if obj:GetAttribute("R63GUI") then
-            obj:Destroy()
-        end
-    end
-
-    for _, obj in ipairs(char:GetChildren()) do
-        if obj:IsA("CharacterMesh") then
-            if obj.Name:match("^R63_") or obj:GetAttribute("R63GUI") then
-                obj:Destroy()
-            end
-        end
-    end
-end
-
-local function getSavedTemplate(clothing, propertyName)
-    local live = clothing[propertyName]
-
-    if live and live ~= "" then
-        clothing:SetAttribute("R63SavedTemplate", live)
-        return live
-    end
-
-    local saved = clothing:GetAttribute("R63SavedTemplate")
-    if type(saved) == "string" then
-        return saved
-    end
-
-    return ""
-end
-
-local function disableNativeClassicClothing(char)
-    local shirtTexture = ""
-    local pantsTexture = ""
-
-    for _, obj in ipairs(char:GetChildren()) do
-        if obj:IsA("Shirt") then
-            local template = getSavedTemplate(obj, "ShirtTemplate")
-            if template ~= "" then
-                shirtTexture = template
-            end
-
-            if obj.ShirtTemplate ~= "" then
-                obj.ShirtTemplate = ""
-            end
-        elseif obj:IsA("Pants") then
-            local template = getSavedTemplate(obj, "PantsTemplate")
-            if template ~= "" then
-                pantsTexture = template
-            end
-
-            if obj.PantsTemplate ~= "" then
-                obj.PantsTemplate = ""
-            end
-        end
-    end
-
-    return shirtTexture, pantsTexture
-end
-
-local function restoreNativeClassicClothing(char)
-    for _, obj in ipairs(char:GetChildren()) do
-        if obj:IsA("Shirt") then
-            local saved = obj:GetAttribute("R63SavedTemplate")
-            if type(saved) == "string" and saved ~= "" then
-                obj.ShirtTemplate = saved
-            end
-            obj:SetAttribute("R63SavedTemplate", nil)
-        elseif obj:IsA("Pants") then
-            local saved = obj:GetAttribute("R63SavedTemplate")
-            if type(saved) == "string" and saved ~= "" then
-                obj.PantsTemplate = saved
-            end
-            obj:SetAttribute("R63SavedTemplate", nil)
-        end
-    end
-end
-
-local function clearClothingOverlays(char)
-    for _, obj in ipairs(char:GetChildren()) do
-        if obj:GetAttribute("R63ClothingOverlay") then
-            obj:Destroy()
-        end
-    end
-end
-
-local function makeOverlay(char, bodyPart, meshUri, textureId, kind, scale)
-    if not textureId or textureId == "" then
-        return
-    end
-
-    local overlay = Instance.new("Part")
-    overlay.Name = "R63_" .. kind .. "_" .. bodyPart.Name:gsub(" ", "")
-    overlay.Size = bodyPart.Size
-    overlay.CFrame = bodyPart.CFrame
-    overlay.Color = selectedSkinColor
-    overlay.Material = Enum.Material.SmoothPlastic
-    overlay.Transparency = 0
-    overlay.CanCollide = false
-    overlay.CanTouch = false
-    overlay.CanQuery = false
-    overlay.Massless = true
-    overlay.CastShadow = false
-    overlay.Anchored = false
-    overlay:SetAttribute("R63GUI", true)
-    overlay:SetAttribute("R63ClothingOverlay", true)
-    overlay.Parent = char
-
-    local mesh = Instance.new("SpecialMesh")
-    mesh.Name = "R63ClothingMesh"
-    mesh.MeshType = Enum.MeshType.FileMesh
-    mesh.MeshId = meshUri
-    mesh.TextureId = textureId
-    mesh.Scale = Vector3.new(scale, scale, scale)
-    mesh.Offset = Vector3.new(0, 0, 0)
-    mesh:SetAttribute("R63GUI", true)
-    mesh.Parent = overlay
-
-    local weld = Instance.new("WeldConstraint")
-    weld.Name = "R63ClothingWeld"
-    weld.Part0 = bodyPart
-    weld.Part1 = overlay
-    weld:SetAttribute("R63GUI", true)
-    weld.Parent = overlay
-end
-
-local function syncClassicClothing(char)
-    if clothingSyncBusy or not morphActive then
-        return
-    end
-
-    clothingSyncBusy = true
-
-    local ok, err = pcall(function()
-        clearClothingOverlays(char)
-
-        local shirtTexture, pantsTexture = disableNativeClassicClothing(char)
-
-        for _, partName in ipairs(BODY_ORDER) do
-            local file = BODY[partName]
-            local bodyPart = char:FindFirstChild(partName)
-
-            if bodyPart and bodyPart:IsA("BasePart") then
-                local meshUri = localMeshUris[file] or downloadMesh(file)
-
-                if SHIRT_PARTS[partName] and shirtTexture ~= "" then
-                    makeOverlay(char, bodyPart, meshUri, shirtTexture, "Shirt", 1.004)
-                end
-
-                if PANTS_PARTS[partName] and pantsTexture ~= "" then
-                    makeOverlay(char, bodyPart, meshUri, pantsTexture, "Pants", 1.008)
-                end
-            end
+        if not ok or type(bytes) ~= "string" or #bytes < 100 then
+            error("R63 GUI: failed to download " .. file)
         end
 
-        applySkinColor(char, selectedSkinColor)
+        writefile(path, bytes)
+    end
+
+    meshUris[file] = customAsset(path)
+    return meshUris[file]
+end
+
+local function cloneSafe(obj)
+    local old = obj.Archivable
+    obj.Archivable = true
+
+    local ok, result = pcall(function()
+        return obj:Clone()
     end)
 
-    clothingSyncBusy = false
+    obj.Archivable = old
 
-    if not ok then
-        error(err)
+    if ok then
+        return result
     end
+
+    return nil
 end
 
-local function applyBody(status)
-    local char = getChar()
+local function snapshotCurrentOutfit(char)
+    local result = {
+        shirtTemplate = "",
+        pantsTemplate = "",
+        shirtGraphic = "",
+        accessories = {},
+        bodyColors = nil,
+    }
 
-    if status then
-        status("Loading custom body meshes...")
+    local shirt = char:FindFirstChildOfClass("Shirt")
+    if shirt then
+        result.shirtTemplate = shirt.ShirtTemplate
     end
 
-    removeOldR63Objects(char)
-
-    for _, partName in ipairs(BODY_ORDER) do
-        local part = char:FindFirstChild(partName)
-        local file = BODY[partName]
-
-        if not part or not part:IsA("BasePart") then
-            error("Missing R6 body part: " .. partName)
-        end
-
-        rememberOriginalColor(part)
-
-        local mesh = Instance.new("SpecialMesh")
-        mesh.Name = "R63BodyMesh"
-        mesh.MeshType = Enum.MeshType.FileMesh
-        mesh.MeshId = downloadMesh(file)
-        mesh.Scale = Vector3.new(1, 1, 1)
-        mesh.Offset = Vector3.new(0, 0, 0)
-        mesh:SetAttribute("R63GUI", true)
-        mesh.Parent = part
+    local pants = char:FindFirstChildOfClass("Pants")
+    if pants then
+        result.pantsTemplate = pants.PantsTemplate
     end
 
-    local head = char:FindFirstChild("Head")
-    if head and head:IsA("BasePart") then
-        rememberOriginalColor(head)
+    local graphic = char:FindFirstChildOfClass("ShirtGraphic")
+    if graphic then
+        result.shirtGraphic = graphic.Graphic
     end
 
-    morphActive = true
-    applySkinColor(char, selectedSkinColor)
-
-    RunService.Heartbeat:Wait()
-    syncClassicClothing(char)
-
-    if status then
-        status("R63 morph applied. Clothing background now follows Skin Color.")
-    end
-end
-
-local function resetMorph(status)
-    local char = player.Character
-    if not char then
-        return
+    local bodyColors = char:FindFirstChildOfClass("BodyColors")
+    if bodyColors then
+        result.bodyColors = cloneSafe(bodyColors)
     end
 
-    morphActive = false
-    clearClothingOverlays(char)
-
-    for _, partName in ipairs(BODY_ORDER) do
-        local part = char:FindFirstChild(partName)
-        if part then
-            for _, child in ipairs(part:GetChildren()) do
-                if child:IsA("SpecialMesh") and child:GetAttribute("R63GUI") then
-                    child:Destroy()
-                end
+    for _, child in ipairs(char:GetChildren()) do
+        if child:IsA("Accessory") or child:IsA("Hat") then
+            local copy = cloneSafe(child)
+            if copy then
+                table.insert(result.accessories, copy)
             end
         end
     end
 
-    restoreNativeClassicClothing(char)
-    restoreOriginalColors(char)
-
-    if status then
-        status("R63 morph removed and original body/clothing restored.")
-    end
-end
-
-local function splitIds(text)
-    local result = {}
-    local seen = {}
-
-    for token in tostring(text):gmatch("[^,%s;]+") do
-        local id = token:match("(%d+)")
-        if id and not seen[id] then
-            seen[id] = true
-            table.insert(result, id)
-        end
-    end
-
     return result
 end
 
-local SUPPORTED = {
-    Shirt = true,
-    Pants = true,
-    ShirtGraphic = true,
-    Accessory = true,
-    Hat = true,
-    BodyColors = true,
-}
-
-local function collectSupported(root)
-    local result = {}
-
-    if SUPPORTED[root.ClassName] then
-        table.insert(result, root)
-    end
-
-    for _, obj in ipairs(root:GetDescendants()) do
-        if SUPPORTED[obj.ClassName] then
-            table.insert(result, obj)
-        end
-    end
-
-    return result
-end
-
-local function removeClass(char, className)
-    for _, obj in ipairs(char:GetChildren()) do
-        if obj.ClassName == className then
-            obj:Destroy()
+local function destroyCosmetics(char)
+    for _, child in ipairs(char:GetChildren()) do
+        if child:IsA("Shirt")
+        or child:IsA("Pants")
+        or child:IsA("ShirtGraphic")
+        or child:IsA("Accessory")
+        or child:IsA("Hat")
+        or child:IsA("CharacterMesh") then
+            child:Destroy()
         end
     end
 end
 
-local function findCharacterAttachment(char, accessory, name)
+local function removeVisualMorph(char)
+    local old = char:FindFirstChild("R63VisualMorph")
+    if old then
+        old:Destroy()
+    end
+end
+
+local function rememberPartState(part)
+    if part:GetAttribute("R63OldTransparency") == nil then
+        part:SetAttribute("R63OldTransparency", part.Transparency)
+    end
+
+    if part:GetAttribute("R63OldColor") == nil then
+        part:SetAttribute("R63OldColor", part.Color)
+    end
+end
+
+local function hideOriginalBody(char)
+    for _, partName in ipairs(BODY_ORDER) do
+        local part = char:FindFirstChild(partName)
+
+        if part and part:IsA("BasePart") then
+            rememberPartState(part)
+            part.Transparency = 1
+        end
+    end
+end
+
+local function restoreOriginalBody(char)
+    for _, child in ipairs(char:GetChildren()) do
+        if child:IsA("BasePart") then
+            local oldTransparency = child:GetAttribute("R63OldTransparency")
+            local oldColor = child:GetAttribute("R63OldColor")
+
+            if typeof(oldTransparency) == "number" then
+                child.Transparency = oldTransparency
+                child:SetAttribute("R63OldTransparency", nil)
+            end
+
+            if typeof(oldColor) == "Color3" then
+                child.Color = oldColor
+                child:SetAttribute("R63OldColor", nil)
+            end
+        end
+    end
+end
+
+local function setHeadSkin(char)
+    local head = char:FindFirstChild("Head")
+    if head and head:IsA("BasePart") then
+        rememberPartState(head)
+        head.Color = currentSkinColor()
+    end
+end
+
+local function makeVisualPart(folder, sourcePart, partName, meshUri, textureId, scale, layerName)
+    local visual = Instance.new("Part")
+    visual.Name = layerName .. "_" .. partName:gsub(" ", "")
+    visual.Size = sourcePart.Size
+    visual.CFrame = sourcePart.CFrame
+    visual.Color = currentSkinColor()
+    visual.Material = Enum.Material.SmoothPlastic
+    visual.Transparency = 0
+    visual.CanCollide = false
+    visual.CanTouch = false
+    visual.CanQuery = false
+    visual.Massless = true
+    visual.CastShadow = false
+    visual.Anchored = false
+    visual.Parent = folder
+
+    local mesh = Instance.new("SpecialMesh")
+    mesh.Name = "Mesh"
+    mesh.MeshType = Enum.MeshType.FileMesh
+    mesh.MeshId = meshUri
+    mesh.TextureId = textureId or ""
+    mesh.Scale = Vector3.new(scale, scale, scale)
+    mesh.Offset = Vector3.new(0, 0, 0)
+    mesh.Parent = visual
+
+    local weld = Instance.new("WeldConstraint")
+    weld.Name = "R63Weld"
+    weld.Part0 = sourcePart
+    weld.Part1 = visual
+    weld.Parent = visual
+
+    return visual
+end
+
+local function findAttachmentOnRig(char, accessory, attachmentName)
     for _, obj in ipairs(char:GetDescendants()) do
         if obj:IsA("Attachment")
-        and obj.Name == name
+        and obj.Name == attachmentName
         and not obj:IsDescendantOf(accessory)
         and obj.Parent
         and obj.Parent:IsA("BasePart") then
@@ -544,23 +321,26 @@ local function findCharacterAttachment(char, accessory, name)
     return nil
 end
 
-local function removeAccessoryWelds(handle)
-    for _, obj in ipairs(handle:GetChildren()) do
-        if obj:IsA("Weld")
-        or obj:IsA("WeldConstraint")
-        or obj:IsA("Motor6D") then
-            if obj.Name == "AccessoryWeld" or obj:GetAttribute("R63AccessoryWeld") then
-                obj:Destroy()
+local function stripAccessoryWelds(handle)
+    for _, child in ipairs(handle:GetChildren()) do
+        if child:IsA("Weld")
+        or child:IsA("WeldConstraint")
+        or child:IsA("Motor6D") then
+            if child.Name == "AccessoryWeld" or child:GetAttribute("R63MadeWeld") then
+                child:Destroy()
             end
         end
     end
 end
 
-local function manualAttachAccessory(char, accessory)
+local function attachAccessoryManual(char, accessory)
     local handle = accessory:FindFirstChild("Handle")
+
     if not handle or not handle:IsA("BasePart") then
-        return false, "no Handle"
+        return false
     end
+
+    accessory.Parent = char
 
     handle.Anchored = false
     handle.CanCollide = false
@@ -568,44 +348,45 @@ local function manualAttachAccessory(char, accessory)
     handle.CanQuery = false
     handle.Massless = true
 
-    local handleAttachment = nil
-    local targetAttachment = nil
+    stripAccessoryWelds(handle)
 
-    for _, obj in ipairs(handle:GetChildren()) do
-        if obj:IsA("Attachment") then
-            local target = findCharacterAttachment(char, accessory, obj.Name)
+    local handleAttachment = nil
+    local rigAttachment = nil
+
+    for _, child in ipairs(handle:GetChildren()) do
+        if child:IsA("Attachment") then
+            local target = findAttachmentOnRig(char, accessory, child.Name)
+
             if target then
-                handleAttachment = obj
-                targetAttachment = target
+                handleAttachment = child
+                rigAttachment = target
                 break
             end
         end
     end
 
-    removeAccessoryWelds(handle)
-
-    if handleAttachment and targetAttachment then
-        local targetPart = targetAttachment.Parent
+    if handleAttachment and rigAttachment then
+        local rigPart = rigAttachment.Parent
 
         handle.CFrame =
-            targetPart.CFrame
-            * targetAttachment.CFrame
+            rigPart.CFrame
+            * rigAttachment.CFrame
             * handleAttachment.CFrame:Inverse()
 
         local weld = Instance.new("Weld")
         weld.Name = "AccessoryWeld"
-        weld.Part0 = targetPart
+        weld.Part0 = rigPart
         weld.Part1 = handle
-        weld.C0 = targetAttachment.CFrame
+        weld.C0 = rigAttachment.CFrame
         weld.C1 = handleAttachment.CFrame
-        weld:SetAttribute("R63AccessoryWeld", true)
+        weld:SetAttribute("R63MadeWeld", true)
         weld.Parent = handle
 
         return true
     end
 
-    -- Legacy R6 Hat/Accessory fallback.
     local head = char:FindFirstChild("Head")
+
     if head and head:IsA("BasePart") then
         local attachmentPoint = CFrame.new()
 
@@ -613,124 +394,94 @@ local function manualAttachAccessory(char, accessory)
             attachmentPoint = accessory.AttachmentPoint
         end)
 
-        local headOffset = CFrame.new(0, 0.5, 0)
-        handle.CFrame = head.CFrame * headOffset * attachmentPoint:Inverse()
+        local headPoint = CFrame.new(0, 0.5, 0)
+
+        handle.CFrame =
+            head.CFrame
+            * headPoint
+            * attachmentPoint:Inverse()
 
         local weld = Instance.new("Weld")
         weld.Name = "AccessoryWeld"
         weld.Part0 = head
         weld.Part1 = handle
-        weld.C0 = headOffset
+        weld.C0 = headPoint
         weld.C1 = attachmentPoint
-        weld:SetAttribute("R63AccessoryWeld", true)
+        weld:SetAttribute("R63MadeWeld", true)
         weld.Parent = handle
 
         return true
     end
 
-    return false, "no matching attachment/head"
+    return false
 end
 
-local function accessoryLooksAttached(char, accessory)
-    local handle = accessory:FindFirstChild("Handle")
-    if not handle then
+local function attachAccessory(char, hum, accessory)
+    local copy = cloneSafe(accessory)
+
+    if not copy then
         return false
     end
 
-    for _, obj in ipairs(handle:GetChildren()) do
-        if obj:IsA("Weld") or obj:IsA("WeldConstraint") or obj:IsA("Motor6D") then
-            local p0 = obj.Part0
-            local p1 = obj.Part1
+    copy.Parent = nil
 
-            if (p0 and p0:IsDescendantOf(char))
-            or (p1 and p1:IsDescendantOf(char)) then
-                return true
+    local humanoidOk = pcall(function()
+        hum:AddAccessory(copy)
+    end)
+
+    if humanoidOk and copy.Parent == char then
+        local handle = copy:FindFirstChild("Handle")
+        if handle then
+            for _, child in ipairs(handle:GetChildren()) do
+                if child:IsA("Weld")
+                or child:IsA("WeldConstraint")
+                or child:IsA("Motor6D") then
+                    return true
+                end
             end
         end
     end
 
-    return false
+    if copy.Parent then
+        copy.Parent = nil
+    end
+
+    local attached = attachAccessoryManual(char, copy)
+
+    if not attached then
+        copy:Destroy()
+    end
+
+    return attached
 end
 
-local function addAccessoryReliable(char, hum, source)
-    local clone = source:Clone()
-    clone:SetAttribute("R63GUIAdded", true)
+local function splitIds(text)
+    local ids = {}
+    local seen = {}
 
-    local handle = clone:FindFirstChild("Handle")
-    if not handle then
-        clone:Destroy()
-        return false, "accessory has no Handle"
+    for token in tostring(text):gmatch("[^,%s;]+") do
+        local id = token:match("(%d+)")
+
+        if id and not seen[id] then
+            seen[id] = true
+            table.insert(ids, id)
+        end
     end
 
-    local humanoidWorked = pcall(function()
-        hum:AddAccessory(clone)
-    end)
-
-    if not clone.Parent then
-        clone.Parent = char
-    end
-
-    RunService.Heartbeat:Wait()
-
-    if humanoidWorked and accessoryLooksAttached(char, clone) then
-        table.insert(addedByGui, clone)
-        return true
-    end
-
-    clone.Parent = char
-
-    local ok, why = manualAttachAccessory(char, clone)
-    if ok then
-        table.insert(addedByGui, clone)
-        return true
-    end
-
-    clone:Destroy()
-    return false, why
-end
-
-local function addWearable(char, hum, source)
-    if source:IsA("Accessory") or source:IsA("Hat") then
-        return addAccessoryReliable(char, hum, source)
-    end
-
-    local clone = source:Clone()
-
-    if clone:IsA("Shirt") then
-        removeClass(char, "Shirt")
-        clone.Parent = char
-    elseif clone:IsA("Pants") then
-        removeClass(char, "Pants")
-        clone.Parent = char
-    elseif clone:IsA("ShirtGraphic") then
-        removeClass(char, "ShirtGraphic")
-        clone.Parent = char
-    elseif clone:IsA("BodyColors") then
-        removeClass(char, "BodyColors")
-        clone.Parent = char
-    else
-        clone:Destroy()
-        return false, "unsupported object"
-    end
-
-    clone:SetAttribute("R63GUIAdded", true)
-    table.insert(addedByGui, clone)
-    return true
+    return ids
 end
 
 local function loadAssetRoots(id)
-    local roots = nil
-
-    local ok = pcall(function()
-        roots = game:GetObjects("rbxassetid://" .. id)
+    local ok, roots = pcall(function()
+        return game:GetObjects("rbxassetid://" .. id)
     end)
 
     if ok and type(roots) == "table" and #roots > 0 then
         return roots
     end
 
-    -- Some environments allow LoadAsset when GetObjects does not.
     local loaded = nil
+
     local insertOk = pcall(function()
         loaded = InsertService:LoadAsset(tonumber(id))
     end)
@@ -742,36 +493,80 @@ local function loadAssetRoots(id)
     return {}
 end
 
-local function applyIds(text, status)
-    local char, hum = getChar()
-    local ids = splitIds(text)
+local function collectWearables(root)
+    local found = {}
 
-    if #ids == 0 then
-        error("Enter at least one asset ID.")
+    local function check(obj)
+        if obj:IsA("Shirt")
+        or obj:IsA("Pants")
+        or obj:IsA("ShirtGraphic")
+        or obj:IsA("Accessory")
+        or obj:IsA("Hat")
+        or obj:IsA("BodyColors") then
+            table.insert(found, obj)
+        end
     end
 
-    lastIdText = text
+    check(root)
 
-    local applied = 0
-    local failed = {}
+    for _, obj in ipairs(root:GetDescendants()) do
+        check(obj)
+    end
 
-    for i, id in ipairs(ids) do
+    return found
+end
+
+local function outfitFromIds(text, status)
+    local result = {
+        shirtTemplate = nil,
+        pantsTemplate = nil,
+        shirtGraphic = nil,
+        accessories = {},
+        bodyColors = nil,
+        foundAny = false,
+        failed = {},
+    }
+
+    local ids = splitIds(text)
+
+    for index, id in ipairs(ids) do
         if status then
-            status(("Loading ID %d/%d: %s"):format(i, #ids, id))
+            status(("Reading asset %d/%d: %s"):format(index, #ids, id))
         end
 
         local roots = loadAssetRoots(id)
-        local found = false
+        local foundThisId = false
 
         for _, root in ipairs(roots) do
-            local objects = collectSupported(root)
+            for _, wearable in ipairs(collectWearables(root)) do
+                if wearable:IsA("Shirt") then
+                    result.shirtTemplate = wearable.ShirtTemplate
+                    foundThisId = true
+                    result.foundAny = true
 
-            for _, obj in ipairs(objects) do
-                local ok = addWearable(char, hum, obj)
+                elseif wearable:IsA("Pants") then
+                    result.pantsTemplate = wearable.PantsTemplate
+                    foundThisId = true
+                    result.foundAny = true
 
-                if ok then
-                    found = true
-                    applied = applied + 1
+                elseif wearable:IsA("ShirtGraphic") then
+                    result.shirtGraphic = wearable.Graphic
+                    foundThisId = true
+                    result.foundAny = true
+
+                elseif wearable:IsA("Accessory") or wearable:IsA("Hat") then
+                    local copy = cloneSafe(wearable)
+
+                    if copy then
+                        table.insert(result.accessories, copy)
+                        foundThisId = true
+                        result.foundAny = true
+                    end
+
+                elseif wearable:IsA("BodyColors") then
+                    result.bodyColors = cloneSafe(wearable)
+                    foundThisId = true
+                    result.foundAny = true
                 end
             end
 
@@ -780,51 +575,245 @@ local function applyIds(text, status)
             end)
         end
 
-        if not found then
-            table.insert(failed, id)
+        if not foundThisId then
+            table.insert(result.failed, id)
         end
     end
 
-    if morphActive then
-        task.wait()
-        syncClassicClothing(char)
-        applySkinColor(char, selectedSkinColor)
+    return result
+end
+
+local function combineOutfits(saved, prompted)
+    local final = {
+        shirtTemplate = saved and saved.shirtTemplate or "",
+        pantsTemplate = saved and saved.pantsTemplate or "",
+        shirtGraphic = saved and saved.shirtGraphic or "",
+        accessories = {},
+        bodyColors = saved and saved.bodyColors or nil,
+    }
+
+    if saved and saved.accessories then
+        for _, acc in ipairs(saved.accessories) do
+            local copy = cloneSafe(acc)
+            if copy then
+                table.insert(final.accessories, copy)
+            end
+        end
     end
 
-    if #failed > 0 then
-        status(
-            ("Applied %d item(s). Couldn't load/attach: %s")
-            :format(applied, table.concat(failed, ", "))
+    if prompted then
+        if prompted.shirtTemplate ~= nil then
+            final.shirtTemplate = prompted.shirtTemplate
+        end
+
+        if prompted.pantsTemplate ~= nil then
+            final.pantsTemplate = prompted.pantsTemplate
+        end
+
+        if prompted.shirtGraphic ~= nil then
+            final.shirtGraphic = prompted.shirtGraphic
+        end
+
+        if prompted.bodyColors ~= nil then
+            final.bodyColors = prompted.bodyColors
+        end
+
+        -- If at least one accessory was explicitly supplied, replace the old
+        -- accessory set with the prompted set. Otherwise keep existing ones.
+        if #prompted.accessories > 0 then
+            final.accessories = {}
+
+            for _, acc in ipairs(prompted.accessories) do
+                local copy = cloneSafe(acc)
+                if copy then
+                    table.insert(final.accessories, copy)
+                end
+            end
+        end
+    end
+
+    return final
+end
+
+local function applySkinToVisuals(char)
+    local color = currentSkinColor()
+    local folder = char:FindFirstChild("R63VisualMorph")
+
+    if folder then
+        for _, obj in ipairs(folder:GetChildren()) do
+            if obj:IsA("BasePart") then
+                obj.Color = color
+            end
+        end
+    end
+
+    setHeadSkin(char)
+end
+
+local function buildMorph(finalOutfit, status)
+    local char, hum = getCharacter()
+
+    removeVisualMorph(char)
+    destroyCosmetics(char)
+    hideOriginalBody(char)
+    setHeadSkin(char)
+
+    local folder = Instance.new("Folder")
+    folder.Name = "R63VisualMorph"
+    folder.Parent = char
+
+    if status then
+        status("Building R63 visual body...")
+    end
+
+    for _, partName in ipairs(BODY_ORDER) do
+        local sourcePart = char:FindFirstChild(partName)
+
+        if not sourcePart or not sourcePart:IsA("BasePart") then
+            error("Missing R6 body part: " .. partName)
+        end
+
+        local meshUri = downloadMesh(BODY_FILES[partName])
+
+        -- Base skin mesh.
+        makeVisualPart(
+            folder,
+            sourcePart,
+            partName,
+            meshUri,
+            "",
+            1.000,
+            "Body"
         )
-    else
-        status(("Applied %d item(s), including accessories."):format(applied))
+
+        -- Shirt texture layer.
+        if SHIRT_PARTS[partName]
+        and finalOutfit.shirtTemplate
+        and finalOutfit.shirtTemplate ~= "" then
+            makeVisualPart(
+                folder,
+                sourcePart,
+                partName,
+                meshUri,
+                finalOutfit.shirtTemplate,
+                1.004,
+                "Shirt"
+            )
+        end
+
+        -- Pants texture layer.
+        if PANTS_PARTS[partName]
+        and finalOutfit.pantsTemplate
+        and finalOutfit.pantsTemplate ~= "" then
+            makeVisualPart(
+                folder,
+                sourcePart,
+                partName,
+                meshUri,
+                finalOutfit.pantsTemplate,
+                1.008,
+                "Pants"
+            )
+        end
+    end
+
+    -- T-shirt graphic still uses native ShirtGraphic because it is a front
+    -- decal rather than a full classic template.
+    if finalOutfit.shirtGraphic and finalOutfit.shirtGraphic ~= "" then
+        local graphic = Instance.new("ShirtGraphic")
+        graphic.Name = "R63ShirtGraphic"
+        graphic.Graphic = finalOutfit.shirtGraphic
+        graphic.Parent = char
+    end
+
+    local accessoryCount = 0
+
+    for _, accessory in ipairs(finalOutfit.accessories or {}) do
+        if attachAccessory(char, hum, accessory) then
+            accessoryCount = accessoryCount + 1
+        end
+    end
+
+    morphActive = true
+    applySkinToVisuals(char)
+
+    if status then
+        status(("R63 rebuilt. %d accessory(s) attached."):format(accessoryCount))
     end
 end
 
-local function clearGuiItems(status)
-    local char = player.Character
+local function applyMorphFromInput(idText, status)
+    local char = getCharacter()
 
-    for i = #addedByGui, 1, -1 do
-        local obj = addedByGui[i]
-        if obj and obj.Parent then
-            obj:Destroy()
-        end
-        addedByGui[i] = nil
+    -- Only take a new snapshot when no morph is active. Otherwise we would
+    -- snapshot our own stripped state and lose the user's original outfit.
+    if not morphActive or not savedOutfit then
+        savedOutfit = snapshotCurrentOutfit(char)
     end
 
-    if char then
-        for _, obj in ipairs(char:GetChildren()) do
-            if obj:GetAttribute("R63GUIAdded") then
-                obj:Destroy()
+    local prompted = nil
+
+    if tostring(idText):match("%d") then
+        lastIdText = idText
+        prompted = outfitFromIds(idText, status)
+    else
+        lastIdText = ""
+    end
+
+    local finalOutfit = combineOutfits(savedOutfit, prompted)
+    buildMorph(finalOutfit, status)
+
+    if prompted and #prompted.failed > 0 then
+        status(
+            "Morph applied. IDs not resolved: "
+            .. table.concat(prompted.failed, ", ")
+        )
+    end
+end
+
+local function resetMorph(status)
+    local char = player.Character
+    if not char then
+        return
+    end
+
+    removeVisualMorph(char)
+    destroyCosmetics(char)
+    restoreOriginalBody(char)
+
+    if savedOutfit then
+        if savedOutfit.shirtTemplate and savedOutfit.shirtTemplate ~= "" then
+            local shirt = Instance.new("Shirt")
+            shirt.ShirtTemplate = savedOutfit.shirtTemplate
+            shirt.Parent = char
+        end
+
+        if savedOutfit.pantsTemplate and savedOutfit.pantsTemplate ~= "" then
+            local pants = Instance.new("Pants")
+            pants.PantsTemplate = savedOutfit.pantsTemplate
+            pants.Parent = char
+        end
+
+        if savedOutfit.shirtGraphic and savedOutfit.shirtGraphic ~= "" then
+            local graphic = Instance.new("ShirtGraphic")
+            graphic.Graphic = savedOutfit.shirtGraphic
+            graphic.Parent = char
+        end
+
+        local hum = char:FindFirstChildOfClass("Humanoid")
+
+        if hum then
+            for _, accessory in ipairs(savedOutfit.accessories or {}) do
+                attachAccessory(char, hum, accessory)
             end
         end
-
-        if morphActive then
-            syncClassicClothing(char)
-        end
     end
 
-    status("Removed items added through the ID box.")
+    morphActive = false
+
+    if status then
+        status("Original character visuals restored.")
+    end
 end
 
 -- =========================
@@ -837,6 +826,7 @@ gui.ResetOnSpawn = false
 gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 
 local parented = false
+
 if gethui then
     parented = pcall(function()
         gui.Parent = gethui()
@@ -858,94 +848,93 @@ if getgenv then
 end
 
 local main = Instance.new("Frame")
-main.Size = UDim2.fromOffset(430, 552)
-main.Position = UDim2.new(0.5, -215, 0.5, -276)
+main.Name = "Main"
+main.AnchorPoint = Vector2.new(0.5, 0.5)
+main.Position = UDim2.fromScale(0.5, 0.5)
+main.Size = UDim2.fromOffset(344, 438)
 main.BackgroundColor3 = Color3.fromRGB(24, 24, 29)
 main.BorderSizePixel = 0
 main.Parent = gui
 
-local guiScale = Instance.new("UIScale")
-guiScale.Name = "R63CompactScale"
-guiScale.Scale = 0.78
-guiScale.Parent = main
+local scale = Instance.new("UIScale")
+scale.Parent = main
 
-local camera = workspace.CurrentCamera
-local function updateGuiScale()
-    camera = workspace.CurrentCamera or camera
+local function updateScale()
+    local camera = workspace.CurrentCamera
     if not camera then
-        guiScale.Scale = 0.78
+        scale.Scale = 1
         return
     end
+
     local viewport = camera.ViewportSize
-    local fitX = math.max(240, viewport.X - 24) / 430
-    local fitY = math.max(300, viewport.Y - 40) / 552
-    guiScale.Scale = math.clamp(math.min(0.78, fitX, fitY), 0.56, 0.78)
+    local fitX = (viewport.X - 18) / 344
+    local fitY = (viewport.Y - 28) / 438
+    scale.Scale = math.clamp(math.min(1, fitX, fitY), 0.68, 1)
 end
-updateGuiScale()
-if camera then
-    camera:GetPropertyChangedSignal("ViewportSize"):Connect(updateGuiScale)
+
+updateScale()
+
+if workspace.CurrentCamera then
+    workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(updateScale)
 end
+
 workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
-    camera = workspace.CurrentCamera
-    updateGuiScale()
-    if camera then
-        camera:GetPropertyChangedSignal("ViewportSize"):Connect(updateGuiScale)
-    end
+    updateScale()
 end)
 
-local corner = Instance.new("UICorner")
-corner.CornerRadius = UDim.new(0, 12)
-corner.Parent = main
+local mainCorner = Instance.new("UICorner")
+mainCorner.CornerRadius = UDim.new(0, 11)
+mainCorner.Parent = main
 
-local outline = Instance.new("UIStroke")
-outline.Color = Color3.fromRGB(76, 76, 90)
-outline.Parent = main
+local mainStroke = Instance.new("UIStroke")
+mainStroke.Color = Color3.fromRGB(76, 76, 90)
+mainStroke.Parent = main
 
 local top = Instance.new("Frame")
-top.Size = UDim2.new(1, 0, 0, 48)
+top.Size = UDim2.new(1, 0, 0, 38)
 top.BackgroundTransparency = 1
 top.Parent = main
 
 local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, -58, 1, 0)
-title.Position = UDim2.fromOffset(16, 0)
+title.Size = UDim2.new(1, -50, 1, 0)
+title.Position = UDim2.fromOffset(12, 0)
 title.BackgroundTransparency = 1
-title.Text = "R63 GUI v3 Compact"
+title.Text = "R63 GUI v4"
 title.TextColor3 = Color3.fromRGB(245, 245, 250)
 title.TextXAlignment = Enum.TextXAlignment.Left
 title.Font = Enum.Font.GothamBold
-title.TextSize = 21
+title.TextSize = 17
 title.Parent = top
 
 local close = Instance.new("TextButton")
-close.Size = UDim2.fromOffset(34, 34)
-close.Position = UDim2.new(1, -42, 0, 7)
+close.Size = UDim2.fromOffset(28, 28)
+close.Position = UDim2.new(1, -34, 0, 5)
 close.BackgroundColor3 = Color3.fromRGB(49, 49, 58)
 close.Text = "×"
 close.TextColor3 = Color3.fromRGB(245, 245, 250)
 close.Font = Enum.Font.GothamBold
-close.TextSize = 22
+close.TextSize = 19
 close.Parent = top
-Instance.new("UICorner", close).CornerRadius = UDim.new(0, 8)
+Instance.new("UICorner", close).CornerRadius = UDim.new(0, 7)
 
 close.MouseButton1Click:Connect(function()
     gui:Destroy()
 end)
 
-local idsLabel = Instance.new("TextLabel")
-idsLabel.Size = UDim2.new(1, -32, 0, 22)
-idsLabel.Position = UDim2.fromOffset(16, 56)
-idsLabel.BackgroundTransparency = 1
-idsLabel.Text = "Clothing / accessory asset IDs"
-idsLabel.TextColor3 = Color3.fromRGB(210, 210, 220)
-idsLabel.TextXAlignment = Enum.TextXAlignment.Left
-idsLabel.Font = Enum.Font.Gotham
-idsLabel.TextSize = 14
-idsLabel.Parent = main
+local idLabel = Instance.new("TextLabel")
+idLabel.Size = UDim2.new(1, -24, 0, 18)
+idLabel.Position = UDim2.fromOffset(12, 42)
+idLabel.BackgroundTransparency = 1
+idLabel.Text = "Optional clothing / accessory IDs"
+idLabel.TextColor3 = Color3.fromRGB(205, 205, 216)
+idLabel.TextXAlignment = Enum.TextXAlignment.Left
+idLabel.Font = Enum.Font.Gotham
+idLabel.TextSize = 12
+idLabel.Parent = main
 
 local idsBox = Instance.new("TextBox")
-idsBox.Size = UDim2.new(1, -32, 0, 66)
-idsBox.Position = UDim2.fromOffset(16, 82)
+idsBox.Size = UDim2.new(1, -24, 0, 46)
+idsBox.Position = UDim2.fromOffset(12, 63)
 idsBox.BackgroundColor3 = Color3.fromRGB(35, 35, 42)
 idsBox.BorderSizePixel = 0
 idsBox.ClearTextOnFocus = false
@@ -954,119 +943,182 @@ idsBox.TextWrapped = true
 idsBox.TextXAlignment = Enum.TextXAlignment.Left
 idsBox.TextYAlignment = Enum.TextYAlignment.Top
 idsBox.TextColor3 = Color3.fromRGB(245, 245, 250)
-idsBox.PlaceholderColor3 = Color3.fromRGB(130, 130, 143)
-idsBox.PlaceholderText = "123456789, 987654321, 555555555"
+idsBox.PlaceholderColor3 = Color3.fromRGB(125, 125, 138)
+idsBox.PlaceholderText = "Leave empty = current outfit"
 idsBox.Font = Enum.Font.Code
-idsBox.TextSize = 14
+idsBox.TextSize = 12
 idsBox.Parent = main
-Instance.new("UICorner", idsBox).CornerRadius = UDim.new(0, 8)
+Instance.new("UICorner", idsBox).CornerRadius = UDim.new(0, 7)
 
-local padding = Instance.new("UIPadding")
-padding.PaddingLeft = UDim.new(0, 10)
-padding.PaddingRight = UDim.new(0, 10)
-padding.PaddingTop = UDim.new(0, 8)
-padding.PaddingBottom = UDim.new(0, 8)
-padding.Parent = idsBox
+local idsPadding = Instance.new("UIPadding")
+idsPadding.PaddingLeft = UDim.new(0, 8)
+idsPadding.PaddingRight = UDim.new(0, 8)
+idsPadding.PaddingTop = UDim.new(0, 6)
+idsPadding.PaddingBottom = UDim.new(0, 6)
+idsPadding.Parent = idsBox
 
-local skinLabel = Instance.new("TextLabel")
-skinLabel.Size = UDim2.new(1, -32, 0, 20)
-skinLabel.Position = UDim2.fromOffset(16, 158)
-skinLabel.BackgroundTransparency = 1
-skinLabel.Text = "Skin Color"
-skinLabel.TextColor3 = Color3.fromRGB(210, 210, 220)
-skinLabel.TextXAlignment = Enum.TextXAlignment.Left
-skinLabel.Font = Enum.Font.Gotham
-skinLabel.TextSize = 14
-skinLabel.Parent = main
+local colorLabel = Instance.new("TextLabel")
+colorLabel.Size = UDim2.fromOffset(145, 18)
+colorLabel.Position = UDim2.fromOffset(12, 115)
+colorLabel.BackgroundTransparency = 1
+colorLabel.Text = "Skin color wheel"
+colorLabel.TextColor3 = Color3.fromRGB(205, 205, 216)
+colorLabel.TextXAlignment = Enum.TextXAlignment.Left
+colorLabel.Font = Enum.Font.Gotham
+colorLabel.TextSize = 12
+colorLabel.Parent = main
 
-local skinBar = Instance.new("Frame")
-skinBar.Size = UDim2.new(1, -32, 0, 30)
-skinBar.Position = UDim2.fromOffset(16, 182)
-skinBar.BackgroundColor3 = Color3.fromRGB(35, 35, 42)
-skinBar.BorderSizePixel = 0
-skinBar.ClipsDescendants = false
-skinBar.Parent = main
-Instance.new("UICorner", skinBar).CornerRadius = UDim.new(0, 8)
+local wheel = Instance.new("Frame")
+wheel.Name = "ColorWheel"
+wheel.Size = UDim2.fromOffset(106, 106)
+wheel.Position = UDim2.fromOffset(12, 136)
+wheel.BackgroundTransparency = 1
+wheel.Parent = main
 
-local skinLayout = Instance.new("UIListLayout")
-skinLayout.FillDirection = Enum.FillDirection.Horizontal
-skinLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
-skinLayout.VerticalAlignment = Enum.VerticalAlignment.Center
-skinLayout.Padding = UDim.new(0, 2)
-skinLayout.Parent = skinBar
+local wheelCenter = Vector2.new(53, 53)
+local dotButtons = {}
+local hueSteps = 24
+local rings = 5
 
-for i, tone in ipairs(SKIN_TONES) do
-    local b = Instance.new("TextButton")
-    b.Name = "Tone" .. i
-    b.Size = UDim2.new(1 / #SKIN_TONES, -3, 1, -6)
-    b.BackgroundColor3 = tone
-    b.BorderSizePixel = 0
-    b.Text = ""
-    b.AutoButtonColor = false
-    b.Parent = skinBar
-    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 5)
+for ring = 1, rings do
+    local sat = ring / rings
+    local radius = 9 + ring * 8
 
-    local stroke = Instance.new("UIStroke")
-    stroke.Name = "SelectedStroke"
-    stroke.Color = Color3.fromRGB(255, 255, 255)
-    stroke.Thickness = 2
-    stroke.Enabled = (i == selectedSkinIndex)
-    stroke.Parent = b
+    for step = 0, hueSteps - 1 do
+        local hue = step / hueSteps
+        local angle = hue * math.pi * 2 - math.pi / 2
+        local x = wheelCenter.X + math.cos(angle) * radius
+        local y = wheelCenter.Y + math.sin(angle) * radius
 
-    skinButtons[i] = b
+        local dot = Instance.new("TextButton")
+        dot.Size = UDim2.fromOffset(9, 9)
+        dot.Position = UDim2.fromOffset(x - 4.5, y - 4.5)
+        dot.BackgroundColor3 = Color3.fromHSV(hue, sat, skinV)
+        dot.BorderSizePixel = 0
+        dot.Text = ""
+        dot.AutoButtonColor = false
+        dot.Parent = wheel
+        Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
 
-    b.MouseButton1Click:Connect(function()
-        selectedSkinIndex = i
-        selectedSkinColor = tone
-        updateSkinButtonSelection()
+        table.insert(dotButtons, {
+            button = dot,
+            h = hue,
+            s = sat,
+        })
 
-        local char = player.Character
-        if char then
-            applySkinColor(char, tone)
-
-            if morphActive then
-                pcall(function()
-                    syncClassicClothing(char)
-                end)
-            end
-        end
-    end)
+        dot.MouseButton1Click:Connect(function()
+            skinH = hue
+            skinS = sat
+            applySkinToVisuals(player.Character or getCharacter())
+        end)
+    end
 end
 
-local function button(text, x, y, w)
+local centerDot = Instance.new("TextButton")
+centerDot.Size = UDim2.fromOffset(16, 16)
+centerDot.Position = UDim2.fromOffset(45, 45)
+centerDot.BackgroundColor3 = Color3.fromHSV(0, 0, skinV)
+centerDot.BorderSizePixel = 0
+centerDot.Text = ""
+centerDot.AutoButtonColor = false
+centerDot.Parent = wheel
+Instance.new("UICorner", centerDot).CornerRadius = UDim.new(1, 0)
+
+centerDot.MouseButton1Click:Connect(function()
+    skinS = 0
+    applySkinToVisuals(player.Character or getCharacter())
+end)
+
+local preview = Instance.new("Frame")
+preview.Size = UDim2.fromOffset(28, 28)
+preview.Position = UDim2.fromOffset(132, 138)
+preview.BackgroundColor3 = currentSkinColor()
+preview.BorderSizePixel = 0
+preview.Parent = main
+Instance.new("UICorner", preview).CornerRadius = UDim.new(1, 0)
+
+local previewStroke = Instance.new("UIStroke")
+previewStroke.Color = Color3.fromRGB(235, 235, 240)
+previewStroke.Parent = preview
+
+local darkBtn = Instance.new("TextButton")
+darkBtn.Size = UDim2.fromOffset(78, 30)
+darkBtn.Position = UDim2.fromOffset(132, 178)
+darkBtn.BackgroundColor3 = Color3.fromRGB(49, 49, 58)
+darkBtn.BorderSizePixel = 0
+darkBtn.Text = "Darker"
+darkBtn.TextColor3 = Color3.fromRGB(240, 240, 245)
+darkBtn.Font = Enum.Font.GothamSemibold
+darkBtn.TextSize = 12
+darkBtn.Parent = main
+Instance.new("UICorner", darkBtn).CornerRadius = UDim.new(0, 7)
+
+local lightBtn = Instance.new("TextButton")
+lightBtn.Size = UDim2.fromOffset(78, 30)
+lightBtn.Position = UDim2.fromOffset(218, 178)
+lightBtn.BackgroundColor3 = Color3.fromRGB(49, 49, 58)
+lightBtn.BorderSizePixel = 0
+lightBtn.Text = "Lighter"
+lightBtn.TextColor3 = Color3.fromRGB(240, 240, 245)
+lightBtn.Font = Enum.Font.GothamSemibold
+lightBtn.TextSize = 12
+lightBtn.Parent = main
+Instance.new("UICorner", lightBtn).CornerRadius = UDim.new(0, 7)
+
+local function refreshColorUI()
+    preview.BackgroundColor3 = currentSkinColor()
+
+    for _, data in ipairs(dotButtons) do
+        data.button.BackgroundColor3 =
+            Color3.fromHSV(data.h, data.s, skinV)
+    end
+
+    centerDot.BackgroundColor3 = Color3.fromHSV(0, 0, skinV)
+    applySkinToVisuals(player.Character or getCharacter())
+end
+
+darkBtn.MouseButton1Click:Connect(function()
+    skinV = math.clamp(skinV - 0.08, 0.16, 1)
+    refreshColorUI()
+end)
+
+lightBtn.MouseButton1Click:Connect(function()
+    skinV = math.clamp(skinV + 0.08, 0.16, 1)
+    refreshColorUI()
+end)
+
+local function makeButton(text, x, y, width)
     local b = Instance.new("TextButton")
-    b.Size = UDim2.fromOffset(w, 42)
+    b.Size = UDim2.fromOffset(width, 34)
     b.Position = UDim2.fromOffset(x, y)
     b.BackgroundColor3 = Color3.fromRGB(51, 51, 61)
     b.BorderSizePixel = 0
     b.Text = text
     b.TextColor3 = Color3.fromRGB(245, 245, 250)
     b.Font = Enum.Font.GothamSemibold
-    b.TextSize = 14
+    b.TextSize = 12
     b.Parent = main
-    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 8)
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 7)
     return b
 end
 
-local applyMorphBtn = button("Apply R63 morph + current outfit", 16, 226, 398)
-local refreshBtn = button("Refresh clothing", 16, 278, 194)
-local applyIdsBtn = button("Apply IDs / accessories", 220, 278, 194)
-local applyAllBtn = button("Apply morph + IDs", 16, 330, 398)
-local clearBtn = button("Clear ID-added items", 16, 382, 194)
-local resetBtn = button("Reset morph", 220, 382, 194)
-local autoBtn = button("Auto reapply on respawn: OFF", 16, 434, 398)
+local applyBtn = makeButton("Rebuild morph", 12, 252, 320)
+local currentBtn = makeButton("Use current outfit", 12, 294, 154)
+local idsBtn = makeButton("Use IDs + fallback", 178, 294, 154)
+local resetBtn = makeButton("Reset original", 12, 336, 154)
+local autoBtn = makeButton("Auto respawn: OFF", 178, 336, 154)
 
 local statusLabel = Instance.new("TextLabel")
-statusLabel.Size = UDim2.new(1, -32, 0, 62)
-statusLabel.Position = UDim2.fromOffset(16, 486)
+statusLabel.Size = UDim2.new(1, -24, 0, 54)
+statusLabel.Position = UDim2.fromOffset(12, 378)
 statusLabel.BackgroundTransparency = 1
-statusLabel.Text = "Ready. Pick Skin Color, then apply the morph."
-statusLabel.TextColor3 = Color3.fromRGB(165, 165, 180)
+statusLabel.Text = "Ready. Empty ID box keeps the outfit already on your character."
+statusLabel.TextColor3 = Color3.fromRGB(160, 160, 176)
 statusLabel.TextXAlignment = Enum.TextXAlignment.Left
 statusLabel.TextYAlignment = Enum.TextYAlignment.Top
 statusLabel.TextWrapped = true
 statusLabel.Font = Enum.Font.Gotham
-statusLabel.TextSize = 12
+statusLabel.TextSize = 11
 statusLabel.Parent = main
 
 local function status(text)
@@ -1084,53 +1136,31 @@ local function run(fn)
 
     task.spawn(function()
         local ok, err = pcall(fn)
+
         if not ok then
             status("Error: " .. tostring(err))
         end
+
         busy = false
     end)
 end
 
-applyMorphBtn.MouseButton1Click:Connect(function()
+applyBtn.MouseButton1Click:Connect(function()
     run(function()
-        applyBody(status)
+        applyMorphFromInput(idsBox.Text, status)
     end)
 end)
 
-refreshBtn.MouseButton1Click:Connect(function()
+currentBtn.MouseButton1Click:Connect(function()
     run(function()
-        local char = getChar()
-
-        if not morphActive then
-            applyBody(status)
-        else
-            syncClassicClothing(char)
-            status("Current Shirt/Pants mapping refreshed.")
-        end
+        idsBox.Text = ""
+        applyMorphFromInput("", status)
     end)
 end)
 
-applyIdsBtn.MouseButton1Click:Connect(function()
+idsBtn.MouseButton1Click:Connect(function()
     run(function()
-        applyIds(idsBox.Text, status)
-    end)
-end)
-
-applyAllBtn.MouseButton1Click:Connect(function()
-    run(function()
-        applyBody(status)
-
-        if idsBox.Text:match("%d") then
-            applyIds(idsBox.Text, status)
-        end
-
-        status("Morph, skin color, clothing and selected IDs applied.")
-    end)
-end)
-
-clearBtn.MouseButton1Click:Connect(function()
-    run(function()
-        clearGuiItems(status)
+        applyMorphFromInput(idsBox.Text, status)
     end)
 end)
 
@@ -1142,68 +1172,27 @@ end)
 
 autoBtn.MouseButton1Click:Connect(function()
     autoReapply = not autoReapply
-    autoBtn.Text = "Auto reapply on respawn: " .. (autoReapply and "ON" or "OFF")
+    autoBtn.Text = "Auto respawn: " .. (autoReapply and "ON" or "OFF")
     status(autoReapply and "Auto reapply enabled." or "Auto reapply disabled.")
 end)
 
-player.CharacterAdded:Connect(function(char)
+player.CharacterAdded:Connect(function()
     morphActive = false
-
-    task.wait(0.25)
-
-    local sample = char:FindFirstChild("Head") or char:FindFirstChild("Torso")
-    if sample and sample:IsA("BasePart") then
-        selectedSkinIndex = nearestSkinTone(sample.Color)
-        selectedSkinColor = SKIN_TONES[selectedSkinIndex]
-        updateSkinButtonSelection()
-    end
+    savedOutfit = nil
 
     if not autoReapply then
         return
     end
 
-    task.wait(1)
+    task.wait(1.15)
 
     run(function()
-        applyBody(status)
-
-        if lastIdText:match("%d") then
-            applyIds(lastIdText, status)
-        end
-
-        status("R63 morph reapplied after respawn.")
+        applyMorphFromInput(lastIdText, status)
+        status("R63 morph rebuilt after respawn.")
     end)
 end)
 
-local watchedCharacter = nil
-
-local function watchCharacter(char)
-    watchedCharacter = char
-
-    char.ChildAdded:Connect(function(obj)
-        if watchedCharacter ~= char or not morphActive then
-            return
-        end
-
-        if obj:IsA("Shirt") or obj:IsA("Pants") then
-            task.defer(function()
-                if morphActive and char.Parent then
-                    pcall(function()
-                        syncClassicClothing(char)
-                    end)
-                end
-            end)
-        end
-    end)
-end
-
-if player.Character then
-    watchCharacter(player.Character)
-end
-
-player.CharacterAdded:Connect(watchCharacter)
-
--- Drag window.
+-- Dragging still starts from the title bar, but initial position is always center.
 do
     local dragging = false
     local dragStart = nil
@@ -1242,4 +1231,4 @@ do
     end)
 end
 
-updateSkinButtonSelection()
+refreshColorUI()
