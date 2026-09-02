@@ -1,65 +1,45 @@
-# R63 GUI
+# R63 GUI v7
 
-A small R6 morph GUI that:
+R63 GUI is an executor-side **R6-only** visual morph. It keeps the original R6 rig and welds the included custom body meshes to it.
 
-- downloads the included custom body `.mesh` files;
-- applies them as `CharacterMesh` objects so classic shirt/pants mapping can remain on the R6 morph;
-- accepts comma-separated Roblox asset IDs;
-- supports classic `Shirt`, `Pants`, `ShirtGraphic`, `Accessory` / legacy `Hat`, and `BodyColors` objects returned by `game:GetObjects`;
-- can reapply the morph after respawn.
+## Run
 
-## Repository layout
+~~~lua
+loadstring(game:HttpGet("https://raw.githubusercontent.com/a65407112-boop/r63/main/loader.lua?nocache=" .. tostring(os.time())))()
+~~~
 
-```text
-R63-GUI/
-├─ hub.lua
-├─ loader.lua
-└─ meshes/
-   ├─ torso.mesh
-   ├─ leftarm.mesh
-   ├─ rightarm.mesh
-   ├─ leftleg.mesh
-   └─ rightleg.mesh
-```
+Use loader.lua, not a copied old hub.lua link. The loader adds a cache-busting query and verifies that GitHub returned v7.
 
-## GitHub setup
+## v7 fixes
 
-1. Create a GitHub repository.
-2. Upload **the contents of this folder to the repository root**.
-3. Edit only these two lines in `loader.lua`:
+- preserves and restores the original classic outfit, face, accessories, body colors and CharacterMesh objects;
+- safely cleans an old v5/v6 morph before a reload;
+- keeps skin-colored body layers separate from untinted white shirt/pants layers;
+- lets transparent clothing pixels reveal the selected skin color;
+- resolves classic shirt, pants, T-shirt, face and all rigid accessory categories through HumanoidDescription;
+- replaces only accessory categories supplied by custom IDs and preserves the rest;
+- removes stale accessory welds, verifies Roblox's new weld and uses attachment/manual fallbacks when needed;
+- validates every downloaded mesh by header and exact byte size so a broken cache cannot be reused;
+- supports Normal, Faceless and Invisible head modes;
+- includes an HSV skin wheel, brightness controls, responsive scaling and auto-reapply after respawn;
+- makes hub.lua the only maintained implementation; r63_v6.lua remains a compatibility loader.
 
-```lua
-local GITHUB_USERNAME = "YOUR_USERNAME"
-local GITHUB_REPOSITORY = "YOUR_REPOSITORY"
-```
+Layered clothing is intentionally reported as unsupported. Roblox wrap layers do not conform reliably to this custom R6 morph; classic shirt/pants textures are mapped directly to the mesh UVs instead.
 
-4. Commit the changes.
-5. Run your raw `loader.lua` through your executor, for example:
+## Requirements
 
-```lua
-loadstring(game:HttpGet("https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPOSITORY/main/loader.lua"))()
-```
+- an R6 character;
+- game:HttpGet and loadstring;
+- writefile;
+- getcustomasset or getsynasset.
 
-## Usage
+makefolder, isfile and readfile are optional. Without makefolder, the mesh cache is stored as flat files.
 
-- Character must be **R6**.
-- Click **Apply R63 body meshes** to apply the included morph.
-- Put IDs in the text box separated by commas:
-  `123456789, 987654321, 555555555`
-- Click **Apply IDs** for clothing/accessories only.
-- Click **Apply all** to apply the body first and then the IDs.
-- **Auto reapply on respawn** reapplies the current morph after respawn.
+## Files
 
-## Executor requirements
-
-The script needs an executor with:
-
-- `game:HttpGet`
-- `writefile`
-- `getcustomasset` or `getsynasset`
-
-`isfile`, `readfile`, and `makefolder` are optional but improve caching.
-
-## Note about classic clothing
-
-The script uses `CharacterMesh` instead of replacing the R6 limbs with unrelated `MeshPart` instances. This is intentional: it keeps the character as R6 and gives classic shirts/pants the best chance to use the morph's expected UV mapping.
+~~~text
+hub.lua          canonical v7 implementation
+loader.lua       always-fresh public loader
+r63_v6.lua       backwards-compatible redirect to v7
+meshes/          five custom body mesh files
+~~~
